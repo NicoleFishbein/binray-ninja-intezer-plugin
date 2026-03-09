@@ -1,20 +1,32 @@
+import os
+
 from binaryninjaui import UIContext
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from .analysis import format_code_reuse, format_software_type
 
 
-def _addr_item(value):
+_LINK_STYLE = QtGui.QColor('#4ea6f5')
+
+
+def _addr_item(value, clickable=False):
     """QTableWidgetItem that sorts numerically for hex addresses."""
     item = QtWidgets.QTableWidgetItem()
     item.setData(QtCore.Qt.DisplayRole, hex(value) if isinstance(value, int) else str(value))
     item.setData(QtCore.Qt.UserRole, value)
+    if clickable:
+        item.setForeground(_LINK_STYLE)
     return item
 
 
-def _text_item(value):
+def _text_item(value, clickable=False):
     item = QtWidgets.QTableWidgetItem()
     item.setData(QtCore.Qt.DisplayRole, str(value))
+    if clickable:
+        font = item.font()
+        font.setUnderline(True)
+        item.setFont(font)
+        item.setForeground(_LINK_STYLE)
     return item
 
 
@@ -38,9 +50,10 @@ GENE_COLUMNS = [
 
 
 class IntezerBlockTable(QtWidgets.QTableWidget):
-    def __init__(self, bv, block_map, parent=None):
+    def __init__(self, bv, block_map, ui_context=None, parent=None):
         super().__init__(parent)
         self._bv = bv
+        self._ctx = ui_context
         self._populate(block_map)
 
     def _populate(self, block_map):
@@ -53,8 +66,8 @@ class IntezerBlockTable(QtWidgets.QTableWidget):
 
         self.setRowCount(len(block_map))
         for row, entry in enumerate(block_map.values()):
-            self.setItem(row, 0, _addr_item(entry.get('function_address', 0)))
-            self.setItem(row, 1, _text_item(entry.get('function_name', '')))
+            self.setItem(row, 0, _addr_item(entry.get('function_address', 0), clickable=True))
+            self.setItem(row, 1, _text_item(entry.get('function_name', ''), clickable=True))
             self.setItem(row, 2, _addr_item(entry['block_address']))
             self.setItem(row, 3, _addr_item(entry.get('end_block_address', 0)))
             self.setItem(row, 4, _text_item(format_software_type(entry.get('software_type', ''))))
@@ -63,15 +76,25 @@ class IntezerBlockTable(QtWidgets.QTableWidget):
 
         self.resizeColumnsToContents()
         self.cellDoubleClicked.connect(self._on_double_click)
+        self.cellClicked.connect(self._on_click)
+
+    def _navigate(self, addr):
+        ctx = self._ctx or UIContext.activeContext()
+        if ctx and addr:
+            ctx.navigateForBinaryView(self._bv, addr)
+
+    def _on_click(self, row, col):
+        # Single-click on function address or name → jump to function
+        if col in (0, 1):
+            addr_item = self.item(row, 0)
+            if addr_item:
+                self._navigate(addr_item.data(QtCore.Qt.UserRole))
 
     def _on_double_click(self, row, _col):
-        # Navigate to block address on double-click
+        # Double-click anywhere → navigate to block address
         addr_item = self.item(row, 2)
         if addr_item:
-            addr = addr_item.data(QtCore.Qt.UserRole)
-            ctx = UIContext.activeContext()
-            if ctx and addr:
-                ctx.navigateForBinaryView(self._bv, addr)
+            self._navigate(addr_item.data(QtCore.Qt.UserRole))
 
     def contextMenuEvent(self, event):
         menu = QtWidgets.QMenu(self)
@@ -93,9 +116,10 @@ class IntezerBlockTable(QtWidgets.QTableWidget):
 
 
 class IntezerGeneTable(QtWidgets.QTableWidget):
-    def __init__(self, bv, block_map, parent=None):
+    def __init__(self, bv, block_map, ui_context=None, parent=None):
         super().__init__(parent)
         self._bv = bv
+        self._ctx = ui_context
         self._populate(block_map)
 
     def _populate(self, block_map):
@@ -125,19 +149,30 @@ class IntezerGeneTable(QtWidgets.QTableWidget):
             self.setItem(row, 0, _text_item(family))
             self.setItem(row, 1, _text_item(format_software_type(stype)))
             self.setItem(row, 2, _addr_item(block_addr))
-            self.setItem(row, 3, _addr_item(func_addr))
-            self.setItem(row, 4, _text_item(func_name))
+            self.setItem(row, 3, _addr_item(func_addr, clickable=True))
+            self.setItem(row, 4, _text_item(func_name, clickable=True))
 
         self.resizeColumnsToContents()
         self.cellDoubleClicked.connect(self._on_double_click)
+        self.cellClicked.connect(self._on_click)
+
+    def _navigate(self, addr):
+        ctx = self._ctx or UIContext.activeContext()
+        if ctx and addr:
+            ctx.navigateForBinaryView(self._bv, addr)
+
+    def _on_click(self, row, col):
+        # Single-click on function address or name → jump to function
+        if col in (3, 4):
+            addr_item = self.item(row, 3)
+            if addr_item:
+                self._navigate(addr_item.data(QtCore.Qt.UserRole))
 
     def _on_double_click(self, row, _col):
+        # Double-click anywhere → navigate to block address
         addr_item = self.item(row, 2)
         if addr_item:
-            addr = addr_item.data(QtCore.Qt.UserRole)
-            ctx = UIContext.activeContext()
-            if ctx and addr:
-                ctx.navigateForBinaryView(self._bv, addr)
+            self._navigate(addr_item.data(QtCore.Qt.UserRole))
 
     def filter(self, text):
         text = text.lower()
@@ -150,12 +185,21 @@ class IntezerGeneTable(QtWidgets.QTableWidget):
 
 
 class IntezerResultsWidget(QtWidgets.QWidget):
-    def __init__(self, bv, block_map, analysis_url, parent=None):
+    def __init__(self, bv, block_map, analysis_url, sha256='', parent=None):
         super().__init__(parent)
         self.setWindowTitle('Intezer Analyze — Results')
         self.resize(1100, 650)
 
         layout = QtWidgets.QVBoxLayout(self)
+
+        # File info bar
+        file_name = os.path.basename(bv.file.filename) if bv.file.filename else '(unknown)'
+        info_layout = QtWidgets.QHBoxLayout()
+        info_layout.addWidget(QtWidgets.QLabel('<b>File:</b> {}'.format(file_name)))
+        info_layout.addSpacing(20)
+        info_layout.addWidget(QtWidgets.QLabel('<b>SHA-256:</b> {}'.format(sha256)))
+        info_layout.addStretch()
+        layout.addLayout(info_layout)
 
         # URL bar
         url_layout = QtWidgets.QHBoxLayout()
@@ -180,10 +224,13 @@ class IntezerResultsWidget(QtWidgets.QWidget):
         filter_layout.addWidget(self._filter_edit)
         layout.addLayout(filter_layout)
 
+        # Capture UI context now (may be None once our widget takes focus)
+        ctx = UIContext.activeContext()
+
         # Tabs: Blocks | Genes
         self._tabs = QtWidgets.QTabWidget()
-        self._block_table = IntezerBlockTable(bv, block_map, self)
-        self._gene_table = IntezerGeneTable(bv, block_map, self)
+        self._block_table = IntezerBlockTable(bv, block_map, ui_context=ctx, parent=self)
+        self._gene_table = IntezerGeneTable(bv, block_map, ui_context=ctx, parent=self)
         self._tabs.addTab(self._block_table, 'Blocks ({})'.format(len(block_map)))
         gene_rows = self._gene_table.rowCount()
         self._tabs.addTab(self._gene_table, 'Genes ({})'.format(gene_rows))
