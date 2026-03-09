@@ -71,7 +71,7 @@ def _run(bv: bn.BinaryView):
     # Show results panel (UI only available in GUI mode)
     try:
         from .ui import IntezerResultsWidget
-        widget = IntezerResultsWidget(bv, block_map, analysis_url)
+        widget = IntezerResultsWidget(bv, block_map, analysis_url, sha256)
         widget.show_panel()
     except ImportError:
         bn.log_info('[Intezer] Running headless — skipping UI panel.')
