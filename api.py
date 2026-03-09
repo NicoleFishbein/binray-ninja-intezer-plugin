@@ -1,23 +1,12 @@
 import os
-from urllib.parse import urljoin
 
-import requests
-import requests.adapters
-import tenacity
+from intezer_sdk.api import IntezerApiClient
 
-VERSION = '1.0.0'
+VERSION = '2.0.0'
 INTEZER_API_KEY = os.environ.get('INTEZER_API_KEY')
 BASE_URL = os.environ.get('INTEZER_BASE_URL', 'https://analyze.intezer.com')
-API_URL = urljoin(BASE_URL, '/api')
-API_VERSION = 'v2-0'
-ANALYSES_URL = urljoin(BASE_URL, '/analyses')
-
-URLS = {
-    'get_access_token': '{}/{}/get-access-token'.format(API_URL, API_VERSION),
-    'create_plugin_report': '{}/v1-2/files/{{}}/ida-plugin-report'.format(API_URL),
-    'analyze_file': '{}/{}/analyze'.format(API_URL, API_VERSION),
-    'analyze_hash': '{}/{}/analyze-by-hash'.format(API_URL, API_VERSION),
-}
+API_BASE = BASE_URL + '/api'
+ANALYSES_URL = BASE_URL + '/analyses'
 
 
 class IntezerAPIException(Exception):
@@ -37,48 +26,35 @@ class UnsupportedFileException(IntezerAPIException):
 
 
 class Proxy:
+    """Thin wrapper around IntezerApiClient for the ida-plugin-report endpoint.
+
+    Uses the official SDK for authentication and HTTP session management,
+    but calls the v1-2 plugin-report endpoint directly (not wrapped by the SDK).
+    """
+
     def __init__(self, api_key):
-        self._api_key = api_key
-        self._session = None
+        self._api = IntezerApiClient(
+            api_key=api_key,
+            base_url=BASE_URL,
+            api_version='/api/v2-0',
+            user_agent='binja_plugin/{}'.format(VERSION),
+        )
+        self._authenticated = False
 
-    @property
-    def session(self):
-        if not self._session:
-            session = requests.Session()
-            session.mount('https://', requests.adapters.HTTPAdapter(max_retries=3))
-            session.mount('http://', requests.adapters.HTTPAdapter(max_retries=3))
-            session.headers['User-Agent'] = 'binja_plugin/{}'.format(VERSION)
-            self._session = session
-        return self._session
+    def _ensure_auth(self):
+        if not self._authenticated:
+            self._api.authenticate()
+            self._authenticated = True
 
-    def _init_access_token(self):
-        if 'Authorization' not in self.session.headers:
-            response = requests.post(URLS['get_access_token'], json={'api_key': self._api_key})
-            if response.status_code == 401:
-                raise IntezerAPIException(
-                    'Invalid API key (401). Check your INTEZER_API_KEY environment variable.'
-                )
-            response.raise_for_status()
-            token = 'Bearer {}'.format(response.json()['result'])
-            self.session.headers['Authorization'] = token
-
-    _RETRY_ON = (requests.exceptions.ConnectionError, requests.exceptions.Timeout)
-
-    @tenacity.retry(
-        retry=tenacity.retry_if_exception_type(_RETRY_ON),
-        stop=tenacity.stop_after_attempt(2),
-    )
-    def _post(self, url, **kwargs):
-        self._init_access_token()
-        return self.session.post(url, **kwargs)
-
-    @tenacity.retry(
-        retry=tenacity.retry_if_exception_type(_RETRY_ON),
-        stop=tenacity.stop_after_attempt(2),
-    )
-    def _get(self, url, **kwargs):
-        self._init_access_token()
-        return self.session.get(url, **kwargs)
+    def _request(self, method, path, base_url=None, **kwargs):
+        """Make an authenticated request via the SDK client."""
+        self._ensure_auth()
+        return self._api.request_with_refresh_expired_access_token(
+            method=method,
+            path=path,
+            base_url=base_url,
+            **kwargs,
+        )
 
     def create_plugin_report(self, sha256, file_path=None):
         """Request a block-level report for sha256.
@@ -86,7 +62,8 @@ class Proxy:
         If 404, auto-submits the file for analysis then retries.
         Returns the result_url string for polling.
         """
-        response = self._post(URLS['create_plugin_report'].format(sha256))
+        path = '/v1-2/files/{}/ida-plugin-report'.format(sha256)
+        response = self._request('POST', path, base_url=API_BASE)
 
         if response.status_code == 403:
             raise InsufficientQuotaException(
@@ -95,7 +72,7 @@ class Proxy:
 
         if response.status_code == 404:
             self._submit_for_analysis(sha256, file_path)
-            response = self._post(URLS['create_plugin_report'].format(sha256))
+            response = self._request('POST', path, base_url=API_BASE)
 
         if response.status_code == 409:
             raise UnsupportedFileException('File type not supported for Intezer plugin report.')
@@ -109,12 +86,17 @@ class Proxy:
         try:
             if file_path and os.path.isfile(file_path):
                 with open(file_path, 'rb') as fh:
-                    response = self._post(
-                        URLS['analyze_file'],
+                    response = self._request(
+                        'POST',
+                        '/analyze',
                         files={'file': (os.path.basename(file_path), fh)},
                     )
             else:
-                response = self._post(URLS['analyze_hash'], json={'hash': sha256})
+                response = self._request(
+                    'POST',
+                    '/analyze-by-hash',
+                    data={'hash': sha256},
+                )
 
             result_url = response.json()['result_url']
             self.poll_result(result_url, with_api_version=True)
@@ -123,21 +105,29 @@ class Proxy:
                 'File not found in Intezer. Analyze it first at {}'.format(BASE_URL)
             )
 
-    @tenacity.retry(
-        retry=tenacity.retry_if_exception_type(tenacity.TryAgain),
-        stop=tenacity.stop_after_delay(600),
-        wait=tenacity.wait_fixed(5),
-    )
     def poll_result(self, result_url, with_api_version=False):
-        """Poll until job completes. Returns the result dict."""
-        base = '{}/{}/'.format(API_URL, API_VERSION) if with_api_version else API_URL
-        response = self._get(base + result_url)
+        """Poll until job completes. Returns the result dict.
 
-        if response.status_code == 202:
-            raise tenacity.TryAgain()
+        The SDK client handles retries on connection errors automatically.
+        We poll manually since the result_url is a relative path from the API.
+        """
+        import time
 
-        response.raise_for_status()
-        return response.json()['result']
+        base = '{}/v2-0/'.format(API_BASE) if with_api_version else API_BASE
+        deadline = time.monotonic() + 600  # 10 min timeout
+
+        while True:
+            response = self._request('GET', result_url, base_url=base)
+            if response.status_code == 202:
+                if time.monotonic() > deadline:
+                    raise IntezerAPIException(
+                        'Intezer analysis timed out waiting for results. '
+                        'The job may still be running — try again in a few minutes.'
+                    )
+                time.sleep(5)
+                continue
+            response.raise_for_status()
+            return response.json()['result']
 
     def get_analysis_url(self, result_url):
         analysis_id = result_url.split('/')[3]
