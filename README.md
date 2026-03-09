@@ -39,3 +39,6 @@ The plugin will:
 
 - Binary Ninja (with Python plugin support)
 - Intezer Analyze API key
+
+## To Do
+- [ ] Use the Intezer SDK, such as in https://github.com/intezer/malcat
