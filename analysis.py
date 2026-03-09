@@ -5,8 +5,6 @@ import os
 import binaryninja as bn
 from binaryninja import HighlightStandardColor
 
-import tenacity
-
 from .api import INTEZER_API_KEY, IntezerAPIException, Proxy
 
 # Optional block coloring by software type (set to True to enable)
@@ -90,13 +88,7 @@ class BinjaCodeIntelligenceHelper:
         file_path = self._bv.file.filename
         result_url = self._proxy.create_plugin_report(sha256, file_path)
         bn.log_info('[Intezer] Fetching results from {}'.format(result_url))
-        try:
-            ida_plugin_report = self._proxy.poll_result(result_url)
-        except tenacity.RetryError:
-            raise IntezerAPIException(
-                'Intezer analysis timed out waiting for results. '
-                'The job may still be running — try again in a few minutes.'
-            )
+        ida_plugin_report = self._proxy.poll_result(result_url)
 
         analysis_url = self._proxy.get_analysis_url(result_url)
         bn.log_info('[Intezer] Analysis URL: {}'.format(analysis_url))
